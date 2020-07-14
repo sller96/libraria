@@ -1,61 +1,83 @@
 import torch
-from torch import nn, distributions, optim
+from torch import nn, optim
+import torch.nn.functional as F
+import torch.utils.data
+
+from typing import Union
+import numpy as np
 
 
-class VAEBernoulli(nn.Module):
+class VAE(nn.Module):
+    def __init__(self, latent_dim: int = 20, hidden_dim: int = 400):
+        super(VAE, self).__init__()
+        self._latent_dim = latent_dim
+        self.fc1 = nn.Linear(784, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim, latent_dim)
+        self.fc22 = nn.Linear(hidden_dim, latent_dim)
+        self.fc3 = nn.Linear(latent_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, 784)
 
-    def __init__(self, dim, input):
-        super.__init__()
-        self._latent_dim = dim
-        self._input_dim = input.shape[1]
+    def _encode(self, x: torch.Tensor):
+        h1 = F.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
 
-        self.fc_encode_mean = nn.Linear(self._input_dim, self._latent_dim)
-        self.fc_encode_std = nn.Linear(self._input_dim, self._latent_dim)
+    def _sample(self, mu: torch.Tensor, logvar: torch.Tensor):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
-        self.fc_decode_mean = nn.Linear(self._latent_dim, self._input_dim)
+    def _decode(self, z: torch.Tensor):
+        h3 = F.relu(self.fc3(z))
+        return torch.sigmoid(self.fc4(h3))
 
-        self._prior = torch.Tensor([0.5 for _ in range(self._input_dim)])
+    def encode(self, x: np.ndarray):
+        if x.ndim == 2:
+            x = torch.Tensor(x).view(1, 784)
+            mu, logvar = self._encode(x)
+            np_output = self._sample(mu, logvar).detach().numpy()
+            return np_output.squeeze()
 
-    @property
-    def latent_dim(self):
-        return self._latent_dim
+        x = torch.Tensor(x).view(-1, 784)
+        mu, logvar = self._encode(x)
+        return self._sample(mu, logvar).detach().numpy()
 
-    @property
-    def input_dim(self):
-        return self._input_dim
+    def decode(self, z: Union[float, np.ndarray]):
+        z = np.array([z]) if isinstance(z, float) else z
 
-    def encode(self, x:torch.Tensor, return_parameters=False) -> torch.Tensor:
-        mean = nn.ReLU(self.fc_encode_mean(x))
-        std = nn.ReLU(self.fc_encode_std(x))
-        if return_parameters:
-            return mean, std
-        return distributions.Normal(mean, std).sample()
+        if z.ndim == 1 or z.ndim == 0:
+            z = torch.Tensor(z).view(1, self._latent_dim)
+            return self._decode(z).view(28, 28).detach().numpy()
 
-    def decode(self, z: torch.Tensor, return_parameters=False) -> torch.Tensor:
-        logits =nn.ReLU(self.fc_decode_mean(z))
-        b = distributions.continuous_bernoulli.ContinuousBernoulli(logits=logits).sample()
-        if return_parameters:
-            return b
-        return b.sample()
+        z = torch.Tensor(z).view(-1, self._latent_dim)
+        return self._decode(z).view(-1, 28, 28).detach().numpy()
 
-    @classmethod
-    def divergence(cls, mean, sigma):
-        return 0.5 * torch.sum((1 + torch.log(torch.square(sigma)) - torch.square(mean) - torch.square(sigma)))
+    def loss_function(self, x):
+        mu, logvar = self._encode(x.view(-1, 784))
+        z = self._sample(mu, logvar)
+        recon_x = self._decode(z)
 
-    def loss_func(self, x):
-        mean, std = self.encode(x, return_parameters=True)
-        latent = distributions.Normal(mean, std).sample()
-        b = self.decode(latent, return_parameters=True)
+        BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), reduction="sum")
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-        return torch.mean(b.log_prob(x)) + VAEBernoulli.divergence(mean, std)
+        return BCE + KLD
 
-    def optimize(self, x, num_epochs=100):
-        optimizer = optim.SGD(self.parameters())
+    def fit(self, x, epochs=200, batch_size=128, verbose=True):
+        train_loader = torch.utils.data.DataLoader(
+            x, batch_size=batch_size, shuffle=True
+        )
+        for epoch in range(1, epochs + 1):
+            train_loss = 0
+            optimizer = optim.Adam(self.parameters(), lr=1e-2)
+            for batch_idx, data in enumerate(train_loader):
+                optimizer.zero_grad()
+                loss = self.loss_function(data)
+                loss.backward()
+                train_loss += loss.item()
+                optimizer.step()
 
-        for epoch in range(num_epochs):
-            # get the inputs; data is a list of [inputs, labels]
-            # zero the parameter gradients
-            optimizer.zero_grad()
-            loss = self.loss_func(x)
-            loss.backward()
-            optimizer.step()
+            if verbose:
+                print(
+                    "Epoch: {} Average loss: {:.4f}".format(
+                        epoch, train_loss / len(train_loader.dataset)
+                    )
+                )

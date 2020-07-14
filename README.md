@@ -1,2 +1,0 @@
-# libraria
-Library of Algorithms
